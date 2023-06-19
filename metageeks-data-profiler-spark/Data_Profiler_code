@@ -1,0 +1,137 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, length
+import json
+import boto3
+import io
+import re
+
+def read_parquet_file(spark, path):
+    return spark.read.parquet(path)
+
+def get_null_ratio(data, field, total_rows):
+    null_count = data.filter(data[field].isNull()).count()
+    return null_count / total_rows
+
+def get_uniqueness_percentage(data, field, total_rows):
+    distinct_count = data.select(field).distinct().count()
+    return (distinct_count / total_rows) * 100
+
+def get_min_value(data, field):
+    return data.agg({field: "min"}).collect()[0][0]
+
+def get_max_value(data, field):
+    return data.agg({field: "max"}).collect()[0][0]
+
+def get_min_length(data, field):
+    return data.select(length(col(field))).agg({f"length({field})": "min"}).collect()[0][0]
+
+def get_max_length(data, field):
+    return data.select(length(col(field))).agg({f"length({field})": "max"}).collect()[0][0]
+
+def get_avg_length(data, field):
+    return data.select(length(col(field))).agg({f"length({field})": "avg"}).collect()[0][0]
+
+def calculate_storage(data_type, avg_length):
+    if data_type == "IntegerType":
+        min_storage = -avg_length * 2
+        max_storage = avg_length * 2
+    elif data_type == "StringType" or data_type == "TimestampType":
+        min_storage = 0
+        max_storage = avg_length
+    else:
+        min_storage = 0
+        max_storage = 0
+    return min_storage, max_storage
+
+def get_distinct_count(data, field):
+    distinct_count = 0
+    pattern_char = r'[a-zA-Z]'
+    pattern_num = r'\d'
+    pattern_special = r'[!@#$%^&*"(),.?\:{}|<>]'
+    onlychar = 0
+    onlynum = 0
+    charnum = 0
+    charsp = 0
+    numsp = 0
+    all3 = 0
+    
+    for row in data.select(field).collect():
+        string = str(row[field])
+        
+        if string.isalpha() and onlychar == 0:
+            distinct_count += 1
+            onlychar = 1
+        elif string.isdigit() and onlynum == 0:
+            distinct_count += 1
+            onlynum = 1
+        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_num, string)) and not bool(re.search(pattern_special, string)) and charnum == 0:
+            distinct_count += 1
+            charnum = 1
+        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_special, string)) and not bool(re.search(pattern_num, string)) and charsp == 0:
+            distinct_count += 1
+            charsp = 1
+        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_num, string)) and not bool(re.search(pattern_char, string)) and numsp == 0:
+            distinct_count += 1
+            numsp = 1
+        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_char, string)) and bool(re.search(pattern_num, string)) and all3 == 0:
+            distinct_count += 1
+            all3 = 1
+    
+    return distinct_count
+
+spark = SparkSession.builder.appName("NullValueCounter").getOrCreate()
+path = "s3://aws-glue-parquet-target/ustreasury/currency_exchange_20230221-05:02:06/Date=2023-02-21/part-00000-8eaf9740-79f6-4b26-870c-acce74697927.c000.snappy.parquet"
+data = read_parquet_file(spark, path)
+schema = data.schema
+
+schema_dict = {}
+column_uniqueness = {}
+cntr = 1
+total_rows = data.count()
+min_storage_sum = 0
+max_storage_sum = 0
+
+for field in schema.fields:
+    result = {}
+    result["columnPosition"] = cntr
+    result["dataType"] = str(field.dataType)
+    result["nullRatio"] = get_null_ratio(data, field.name, total_rows)
+    result["uniquenessPercentage"] = get_uniqueness_percentage(data, field.name, total_rows)
+    
+    if "date" in result["dataType"].lower() or "integerType" in result["dataType"].lower():
+        result["minValue"] = get_min_value(data, field.name)
+        result["minValuePercentage"] = data.filter(data[field.name] == result["minValue"]).count() / total_rows * 100
+        result["maxValue"] = get_max_value(data, field.name)
+        result["maxValuePercentage"] = data.filter(data[field.name] == result["maxValue"]).count() / total_rows * 100
+    else:
+        result["minValue"] = "NA"
+        result["maxValue"] = "NA"
+    
+    result["minLength"] = get_min_length(data, field.name)
+    result["maxLength"] = get_max_length(data, field.name)
+    result["avgLength"] = get_avg_length(data, field.name)
+    
+    min_storage, max_storage = calculate_storage(result["dataType"], result["avgLength"])
+    result["minStorage(Bytes)"] = min_storage
+    result["maxStorage(Bytes)"] = max_storage
+    
+    result["distinctCount"] = get_distinct_count(data, field.name)
+    schema_dict[field.name] = result
+    cntr += 1
+    min_storage_sum += min_storage
+    max_storage_sum += max_storage
+
+schema_dict["minStorage(Bytes)"] = min_storage_sum
+schema_dict["maxStorage(Bytes)"] = max_storage_sum
+
+# Print the schema dictionary
+print(schema_dict)
+
+json_output = json.dumps(schema_dict, indent=4)
+
+# Store the JSON output in an S3 bucket
+bucket_name = "metageeks-data-profile-results"
+output_path = "inferschema_result"
+file_extension = "json"
+s3 = boto3.client("s3")
+s3.put_object(Bucket=bucket_name, Key=output_path + "." + file_extension, Body=json_output)
