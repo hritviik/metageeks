@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, length, explode_outer, current_timestamp, date_format
+from pyspark.sql.functions import col, length
 import json
 import boto3
 import io
@@ -8,21 +8,125 @@ import pymysql
 import os
 from datetime import datetime
 
-# Create a SparkSession
+def read_parquet_file(spark, path):
+    return spark.read.parquet(path)
+
+def get_null_ratio(data, field, total_rows):
+    null_count = data.filter(data[field].isNull()).count()
+    return null_count / total_rows
+
+def get_uniqueness_percentage(data, field, total_rows):
+    distinct_count = data.select(field).distinct().count()
+    return (distinct_count / total_rows) * 100
+
+def get_min_value(data, field):
+    return data.agg({field: "min"}).collect()[0][0]
+
+def get_max_value(data, field):
+    return data.agg({field: "max"}).collect()[0][0]
+
+def get_min_length(data, field):
+    return data.select(length(col(field))).agg({f"length({field})": "min"}).collect()[0][0]
+
+def get_max_length(data, field):
+    return data.select(length(col(field))).agg({f"length({field})": "max"}).collect()[0][0]
+
+def get_avg_length(data, field):
+    return data.select(length(col(field))).agg({f"length({field})": "avg"}).collect()[0][0]
+
+def calculate_storage(data_type, avg_length,int_dict,datetime_dict):
+    if data_type == "IntegerType":
+        min_storage = 0
+        max_storage = int_dict[data_type]
+    elif data_type == "StringType":
+        min_storage = 0
+        max_storage = avg_length
+    elif data_type=="TimestampType":
+        min_storage=0
+        max_storage=datetime_dict[data_type]
+    else:
+        min_storage = 0
+        max_storage = 0
+    return min_storage, max_storage
+
+def get_distinct_count(data, field):
+    distinct_count = 0
+    pattern_char = r'[a-zA-Z]'
+    pattern_num = r'\d'
+    pattern_special = r'[!@#$%^&*"(),.?\:{}|<>]'
+    onlychar = 0
+    onlynum = 0
+    charnum = 0
+    charsp = 0
+    numsp = 0
+    all3 = 0
+    
+    for row in data.select(field).collect():
+        string = str(row[field])
+        
+        if string.isalpha() and onlychar == 0:
+            distinct_count += 1
+            onlychar = 1
+        elif string.isdigit() and onlynum == 0:
+            distinct_count += 1
+            onlynum = 1
+        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_num, string)) and not bool(re.search(pattern_special, string)) and charnum == 0:
+            distinct_count += 1
+            charnum = 1
+        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_special, string)) and not bool(re.search(pattern_num, string)) and charsp == 0:
+            distinct_count += 1
+            charsp = 1
+        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_num, string)) and not bool(re.search(pattern_char, string)) and numsp == 0:
+            distinct_count += 1
+            numsp = 1
+        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_char, string)) and bool(re.search(pattern_num, string)) and all3 == 0:
+            distinct_count += 1
+            all3 = 1
+    
+    return distinct_count
+
 spark = SparkSession.builder.appName("NullValueCounter").getOrCreate()
-path = "s3://file-data-source-bucket/data service ltd/2023-04-28/studentData_20230428-11_28_38.csv"
-
-
-# Read the data into a DataFrame
-data = spark.read.csv(path, header=True, inferSchema=True)
-# Extract the filename from the path
-filename = os.path.basename(path)
-
-
-# Get the schema of the DataFrame
+path = "s3://aws-glue-parquet-target/ustreasury/currency_exchange_20230221-05:02:06/Date=2023-02-21/part-00000-8eaf9740-79f6-4b26-870c-acce74697927.c000.snappy.parquet"
+data = read_parquet_file(spark, path)
+filename_with_extension = os.path.basename(path)
+filename_without_extension = os.path.splitext(filename_with_extension)[0]
+filename_parts = filename_without_extension.split("-")
+filename = " ".join(filename_parts[1:])
 schema = data.schema
+# Connect to the RDS database
+endpoint = "database-1.codti4vj2iqk.us-east-2.rds.amazonaws.com"
+username = "admin12"
+password = "Capgemini#12"
+database_name = "mg-data-profile-db"
+connection = pymysql.connect(host=endpoint, user=username, passwd=password, db=database_name)
+cursor = connection.cursor()
 
-# Convert schema to dictionary
+# Execute a SELECT query to fetch data from a specific table
+table_name1 = "Date_time_storage_type"
+query = f"SELECT * FROM {table_name1}"
+cursor.execute(query)
+
+# Fetch all the rows returned by the query
+rows = cursor.fetchall()
+datetime_dict = {}
+for row in rows:
+    # Access specific column values using index or column names
+    datetime_dict[row[0]] = row[1]
+    
+
+table_name = "Integer_storage_type"
+query = f"SELECT * FROM {table_name}"
+cursor.execute(query)
+
+# Fetch all the rows returned by the query
+rows = cursor.fetchall()
+int_dict = {}
+for row in rows:
+    # Access specific column values using index or column names
+    int_dict[row[0]] = row[1]
+print(datetime_dict)
+print(int_dict)
+
 schema_dict = {}
 column_uniqueness = {}
 cntr = 1
@@ -34,97 +138,34 @@ for field in schema.fields:
     result = {}
     result["columnPosition"] = cntr
     result["dataType"] = str(field.dataType)
-    null_count = data.filter(data[field.name].isNull()).count()
-    result["nullRatio"] = null_count / total_rows
-    column_data = data.select(field.name).dropna()
-    column_type = str(column_data.schema.fields[0].dataType)
-    distinct_count = data.select(field.name).distinct().count()
-    result["uniquenessPercentage"] = (distinct_count / total_rows) * 100
-    column_uniqueness[field.name] = result
-    if "date" in column_type.lower() or "integertype" in column_type.lower():
-        min_value = column_data.agg({"*": "min"}).collect()[0][0]
-        max_value = column_data.agg({"*": "max"}).collect()[0][0]
-        min_value_percentage = (
-            column_data.filter(column_data[field.name] == min_value).count() / total_rows * 100
-        )
-        max_value_percentage = (
-            column_data.filter(column_data[field.name] == max_value).count() / total_rows * 100
-        )
-        result["minValue"] = min_value
-        result["minValuePercentage"] = min_value_percentage
-        result["maxValue"] = max_value
-        result["maxValuePercentage"] = max_value_percentage
+    result["nullRatio"] = get_null_ratio(data, field.name, total_rows)
+    result["uniquenessPercentage"] = get_uniqueness_percentage(data, field.name, total_rows)
+    
+    if "date" in result["dataType"].lower() or "integerType" in result["dataType"].lower():
+        result["minValue"] = get_min_value(data, field.name)
+        result["minValuePercentage"] = data.filter(data[field.name] == result["minValue"]).count() / total_rows * 100
+        result["maxValue"] = get_max_value(data, field.name)
+        result["maxValuePercentage"] = data.filter(data[field.name] == result["maxValue"]).count() / total_rows * 100
     else:
         result["minValue"] = "NA"
         result["maxValue"] = "NA"
-    max_length = data.select(length(col(field.name))).agg({"length(" + field.name + ")": "max"}).collect()[0][0]
-    result["maxLength"] = max_length
-    min_length = data.select(length(col(field.name))).agg({"length(" + field.name + ")": "min"}).collect()[0][0]
-    result["minlength"] = min_length
-    avg_length = data.select(length(col(field.name))).agg({"length(" + field.name + ")": "avg"}).collect()[0][0]
-    result["avglength"] = avg_length
-
-    distinct_count = 0
-    pattern_char = r"[a-zA-Z]"
-    pattern_num = r"\d"
-    pattern_special = r"[!@#$%^&*\"(),.?:{}|<>]"
-    onlychar = 0
-    onlynum = 0
-    charnum = 0
-    charsp = 0
-    numsp = 0
-    all3 = 0
-    for row in data.select(field.name).collect():
-        string = row[field.name]
-        if isinstance(string, str):
-            pass
-        else:
-            string = str(string)
-
-        if string.isalpha() and onlychar == 0:
-            distinct_count += 1
-            onlychar = 1
-        elif string.isdigit() and onlynum == 0:
-            distinct_count += 1
-            onlynum = 1
-        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_num, string)) and not bool(
-            re.search(pattern_special, string)
-        ) and charnum == 0:
-            distinct_count += 1
-            charnum = 1
-        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_special, string)) and not bool(
-            re.search(pattern_num, string)
-        ) and charsp == 0:
-            distinct_count += 1
-            charsp = 1
-        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_num, string)) and not bool(
-            re.search(pattern_char, string)
-        ) and numsp == 0:
-            distinct_count += 1
-            numsp = 1
-        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_char, string)) and bool(
-            re.search(pattern_num, string)
-        ) and all3 == 0:
-            distinct_count += 1
-            all3 = 1
-    if str(field.dataType) == "IntegerType":
-        min_storage = -avg_length * 2
-        max_storage = avg_length * 2
-    elif str(field.dataType) == "StringType":
-        min_storage = 0
-        max_storage = avg_length
+    
+    result["minLength"] = get_min_length(data, field.name)
+    result["maxLength"] = get_max_length(data, field.name)
+    result["avgLength"] = get_avg_length(data, field.name)
+    
+    min_storage, max_storage = calculate_storage(result["dataType"], result["avgLength"],int_dict,datetime_dict)
     result["minStorage(Bytes)"] = min_storage
     result["maxStorage(Bytes)"] = max_storage
-    result["distinctCount"] = distinct_count
+    
+    result["distinctCount"] = get_distinct_count(data, field.name)
     schema_dict[field.name] = result
     cntr += 1
     min_storage_sum += min_storage
     max_storage_sum += max_storage
 
-    schema_dict["minStorage(Bytes)"] = min_storage_sum
-    schema_dict["maxStorage(Bytes)"] = max_storage_sum
-    
-
+schema_dict["minStorage(Bytes)"] = min_storage_sum
+schema_dict["maxStorage(Bytes)"] = max_storage_sum
 
 # Print the schema dictionary
 print(schema_dict)
@@ -133,17 +174,12 @@ json_output = json.dumps(schema_dict, indent=4)
 
 # Store the JSON output in an S3 bucket
 bucket_name = "metageeks-data-profile-results"
-output_path = "inferschema_result.json"
-
+output_path = "inferschema_result"
+file_extension = "json"
 s3 = boto3.client("s3")
-s3.put_object(Bucket=bucket_name, Key=output_path, Body=json_output)
+s3.put_object(Bucket=bucket_name, Key=output_path + "." + file_extension, Body=json_output)
 
-# Connect to the RDS database
-endpoint = "database-1.codti4vj2iqk.us-east-2.rds.amazonaws.com"
-username = "admin12"
-password = "Capgemini#12"
-database_name = "mg-data-profile-db"
-connection = pymysql.connect(host=endpoint, user=username, passwd=password, db=database_name)
+
 
 # Fetch the current date
 now = datetime.now()
@@ -161,9 +197,6 @@ for i in json1:
     datatype = json1[i]['dataType']
     del json1[i]['columnPosition']
     del json1[i]['dataType']
-    print(colpos)
-    print(datatype)
-    print(json1[i]) 
     
     cursor.execute(
         "INSERT INTO data_profile_result (run_date, run_data_object_name, Column_profile_result, column_name, column_position, column_datatype) VALUES (%s, %s, %s, %s, %s, %s)",
@@ -192,3 +225,4 @@ connection.commit()
 
 # Close the database connection
 connection.close()
+
